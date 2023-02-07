@@ -4,7 +4,6 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <KtaneCore.h>
-#include <SoftwareSerial.h>
 
 #define BLT_SERIAL Serial1
 
@@ -27,7 +26,9 @@ typedef struct MODULE {
 
 Module *modules, *currentMod, *timerModule;
 
-SoftwareSerial bluetooth(10, 11); // RX, TX 
+Status currentStatusBomb = RESETING;
+
+volatile unsigned long lastMillis = 0;
 
 void setup() {
   pinMode(LED_WARNING, OUTPUT);
@@ -57,96 +58,153 @@ void setup() {
     }
   } while(numberModules == 0);
 
-  BLT_SERIAL.println("---------------------------------");
+  BLT_SERIAL.println(F("---------------------------------"));
   while (currentMod != NULL) {
-    BLT_SERIAL.println("address.: " + (String)currentMod->address);
-    BLT_SERIAL.println("codeName: '" + (String)currentMod->codeName + "'");
-    BLT_SERIAL.println("version.: " + (String)currentMod->version);
-    BLT_SERIAL.println("status..: " + Status_name[currentMod->status]);
-    BLT_SERIAL.println("---------------------------------");
+    printInfoModule(currentMod);
     currentMod = currentMod->nextModule;
   }
 
   BLT_SERIAL.println();
   BLT_SERIAL.println((String)F("Modulos configurados: ") + (String) numberModules);
   BLT_SERIAL.println((String)F("Fim do SETUP."));
-
-  return waitBeginGame();
 }
 
 void loop() {
+  switch (currentStatusBomb) {
+    case RESETING:
+    case READY:
+      waitBeginGame();
+      break;
+    case IN_GAME:
+      executeInGame();
+      break;
+    case STOP_GAME:
+      executeStopGame();
+      break;
+  }
+}
+
+void executeInGame() {
   if(BLT_SERIAL.available()) {
     if(BLT_SERIAL.read() == 'r') {
-      BLT_SERIAL.println("Resetando modulos.");
+      BLT_SERIAL.println(F("Resetando modulos."));
       writeAllRegisterModules_byte(STATUS, RESETING);
-      return waitBeginGame();
+      currentStatusBomb = RESETING;
     }
   }
-  delay(1000);
+  
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastMillis > 500) {
+    if (validaTimer() == STOP_GAME) {
+      BLT_SERIAL.println(F("GAME OVER!"));
+      currentStatusBomb = STOP_GAME;
+    }
+    lastMillis = currentMillis;
+  }
+}
 
-  if(validaTimer() == STOP_GAME) {
-    BLT_SERIAL.println("GAME OVER!");
-    char c = '0';
-    while(c != 'r') {
-      if(BLT_SERIAL.available()) {
-        if(BLT_SERIAL.read() == 'r') {
-          BLT_SERIAL.println("Resetando modulos.");
-          writeAllRegisterModules_byte(STATUS, RESETING);
-          return waitBeginGame();
-        }
+void executeStopGame() {
+  BLT_SERIAL.println(F("Fim de jogo reinicie para jogar novamente."));
+  while(true) {
+    if(BLT_SERIAL.available()) {
+      if(BLT_SERIAL.read() == 'r') {
+        BLT_SERIAL.println(F("Resetando modulos."));
+        writeAllRegisterModules_byte(STATUS, RESETING);
+        currentStatusBomb = RESETING;
+        break;
       }
     }
-  }  
+  }
 }
 
 Status validaTimer() {
   byte *response;
   requestRegisterModule_byte(timerModule->address, STATUS, &response);
-  BLT_SERIAL.print("status modulo: ");
-  BLT_SERIAL.println(Status_name[*response]);
+  BLT_SERIAL.println((String)F("status modulo: ") + Status_name[*response]);
   return (Status)*response;
 }
 
 void waitBeginGame() {
-  BLT_SERIAL.println("Aguardando instrucao para iniciar jogo.");
-  BLT_SERIAL.println(" 1 - Jogar");
-  BLT_SERIAL.println(" e - Ativa os modulos(teste)");
-  BLT_SERIAL.println(" d - Desativa os modulos(teste)");
-  BLT_SERIAL.println(" r - Resetar(em jogo)");
+  BLT_SERIAL.println(F("Aguardando instrucao para iniciar jogo."));
+  BLT_SERIAL.println(F("Funcoes de modulos. Exemplo: m;0;c;60000"));
+  BLT_SERIAL.println(F("Funcoes do core. Exemplo: c;r"));
+  BLT_SERIAL.println(F(" c;1; - Jogar"));
+  BLT_SERIAL.println(F(" c;r; - Resetar"));
+  BLT_SERIAL.println(F(" m;X;e;1; - Ativar/Desativar o modulo."));
+  BLT_SERIAL.println(F(" m;X;c;DATA; - Configurar modulo."));
 
-  char command = '0';
-  do {
-    command = BLT_SERIAL.read();
-    if(command == 'e') {
-      writeAllRegisterModules_byte(ENABLED, true);
-    } else if(command == 'd') {
-      writeAllRegisterModules_byte(ENABLED, false);
-    } else if(command == 'c') {
-      BLT_SERIAL.println("Enviando dados para configurar modulo.");
-      int numBytes = BLT_SERIAL.available();
-      char buf[numBytes+1];
-      BLT_SERIAL.readBytes(buf, numBytes);
-      buf[numBytes] = '\0';
-      BLT_SERIAL.print("buf: ");
-      BLT_SERIAL.println(buf);
-      String mensagem = "";
-      mensagem.concat(buf);
-      BLT_SERIAL.print("mensagem: ");
-      BLT_SERIAL.println(mensagem);
-      writeConfigRegisterModule(timerModule->address, command, mensagem);
+  String command;
+  while(true) {
+    command = BLT_SERIAL.readStringUntil(';');
+
+    if (command.equalsIgnoreCase("m")) {
+      String addressMod = BLT_SERIAL.readStringUntil(';');
+      if (addressMod.equals("")) addressMod = "-1";
+      
+      Module* mod = getModuleByAddress(addressMod.toInt());
+      if (mod != NULL) {
+        BLT_SERIAL.println(F("Modulo encontrado para configurar: "));
+        printInfoModule(mod);
+        
+        String action = BLT_SERIAL.readStringUntil(';');
+        
+        if(action.equalsIgnoreCase("e")) {
+          String mensagem = BLT_SERIAL.readStringUntil(';');
+          if (mensagem.equals("0") || mensagem.equals("1")) {
+            writeRegisterModule_byte(mod->address, ENABLED, mensagem.equals("1"));
+          } else {
+            BLT_SERIAL.println((String)F("opcao invalida: ") + mensagem);   
+          }
+        } else if(action.equalsIgnoreCase("c")) {
+          String mensagem = BLT_SERIAL.readStringUntil(';');
+          BLT_SERIAL.println((String)F("data enviado: ") + mensagem);
+          writeConfigRegisterModule(mod->address, action.c_str()[0], mensagem);
+        } else {
+          BLT_SERIAL.println((String)F("opcao invalida: ") + action);          
+        }
+      } else {
+        BLT_SERIAL.println((String)F("Nao existe modulo com o address: ") + addressMod);
+      }
+    } else if (command.equalsIgnoreCase("c")) {
+      String action = BLT_SERIAL.readStringUntil(';');
+      if (action.equalsIgnoreCase("1")) {
+        break;
+      } else if (action.equalsIgnoreCase("r")) {
+        BLT_SERIAL.println(F("Not implemented"));
+      }
     }
-  } while(command != '1');
+  }
   
-  BLT_SERIAL.println("Começando jogo em...");
-  BLT_SERIAL.println("3");
-  delay(1000);
-  BLT_SERIAL.println("2");
-  delay(1000);
-  BLT_SERIAL.println("1");
-  delay(1000);
+  BLT_SERIAL.println((String)F("Começando jogo em..."));
+  for (int i = 3; i > 0; i--) {
+    BLT_SERIAL.println(i);
+    delay(1000);
+  }
+  BLT_SERIAL.println((String)F("GO!"));
 
+  currentStatusBomb = IN_GAME;
   sendBeginGame();
-  return loop();
+}
+
+void printInfoModule(Module* mod) {
+  if (mod != NULL) {
+    BLT_SERIAL.println((String)F("address.: ") + (String)mod->address);
+    BLT_SERIAL.println((String)F("codeName: ") + (String)mod->codeName);
+    BLT_SERIAL.println((String)F("version.: ") + (String)mod->version);
+    BLT_SERIAL.println((String)F("status..: ") + Status_name[mod->status]);
+    BLT_SERIAL.println(F("---------------------------------"));
+  }
+}
+
+Module* getModuleByAddress(int address) {
+  currentMod = modules;
+  while (currentMod != NULL) {
+    if (currentMod->address == address) {
+      return currentMod;
+    }
+    currentMod = currentMod->nextModule;
+  }
+  return NULL;
 }
 
 void sendBeginGame() {
@@ -157,7 +215,7 @@ void sendBeginGame() {
     currentMod = currentMod->nextModule;
   }
 
-  BLT_SERIAL.println("Modulos avisados do inicio do game.");
+  BLT_SERIAL.println(F("Modulos avisados do inicio do game."));
 }
 
 int readModules() {
@@ -169,9 +227,9 @@ int readModules() {
 
   BLT_SERIAL.println(F("Iniciando a varredura de modulos."));
   for (int x = 0; x < MAX_ADDRESS; x++) {
-    BLT_SERIAL.println("----------------- address 0x0" + (String) x + " -----------------");
+    BLT_SERIAL.println((String)F("------------- address 0x0") + (String) x + (String)F(" -------------"));
     //inicia a transmição com um endereço e finaliza para verificar se houve resposta(se existe)
-    BLT_SERIAL.println("Iniciando leitura do endereco: " + (String) x);
+    BLT_SERIAL.println((String)F("Iniciando leitura do endereco: ") + (String) x);
     Wire.beginTransmission(x);
     int error = Wire.endTransmission();
 
@@ -191,13 +249,13 @@ int readModules() {
       byte *slaveStatus;
 
       requestRegisterModule(x, CODE_NAME, &slaveCodeName);
-      BLT_SERIAL.println("Mensagem retornada do slave: '" + (String)slaveCodeName + "'");
+      BLT_SERIAL.println((String)F("slaveCodeName: ") + (String)slaveCodeName);
       
       requestRegisterModule(x, VERSION, &slaveVersion);
-      BLT_SERIAL.println("Mensagem retornada do slave: " + (String)slaveVersion);
+      BLT_SERIAL.println((String)F("slaveVersion.: ") + (String)slaveVersion);
 
       requestRegisterModule_byte(x, STATUS, &slaveStatus);
-      BLT_SERIAL.println("Mensagem retornada do slave: " + (String)(*slaveStatus));
+      BLT_SERIAL.println((String)F("slaveStatus..: ") + (String)(*slaveStatus));
 
 
       currentMod->address = x;
@@ -212,9 +270,9 @@ int readModules() {
       }
 
       numbersModules++;
-      BLT_SERIAL.println("reqSlave_address: " + (String)currentMod->address);
+      BLT_SERIAL.println((String)F("reqSlave_address: ") + (String)currentMod->address);
     } else {
-      BLT_SERIAL.println("Sem Resposta, retorno: " + (String) error);
+      BLT_SERIAL.println((String)F("Sem Resposta, retorno: ") + (String) error);
     }
     BLT_SERIAL.println(F("------------------------------------------------"));
   }
@@ -222,7 +280,7 @@ int readModules() {
 
   currentMod = modules;
 
-  BLT_SERIAL.println("Numero de modulos encontrados: " + (String) numbersModules);
+  BLT_SERIAL.println((String)F("Numero de modulos encontrados: ") + (String) numbersModules);
   return numbersModules;
 }
 
@@ -264,7 +322,7 @@ boolean writeConfigRegisterModule(int i2c_addr, char command, String message) {
   error_code  = Wire.endTransmission();    
 
   if (error_code) {
-    BLT_SERIAL.println("Fim da transmissao com erro: " + error_code);
+    BLT_SERIAL.println((String)F("Fim da transmissao com erro: ") + error_code);
     return false;
   }
   
