@@ -1,6 +1,8 @@
+
 /**   Arduino: Mega
   *   created by: Relry Pereira dos Santos
   */
+#include <EEPROM.h>
 #include <Arduino.h>
 #include <Wire.h>
 #include <KtaneCore.h>
@@ -9,12 +11,14 @@
 
 #define PIN_SDA 20
 #define PIN_SCL 21
-
-#define PIN_RESET 2
+#define LED_WARNING 13
 
 #define MAX_ADDRESS 8
 
-#define LED_WARNING 13
+#define EEPROM_ADDRESS_TIME_DISPLAY 1023
+
+#define ID_DISPLAY_TIMER "module-display"
+#define MAX_FAULT_DEFUSE 3
 
 typedef struct MODULE {
   int address;
@@ -29,6 +33,7 @@ Module *modules, *currentMod, *timerModule;
 Status currentStatusBomb = RESETING;
 
 volatile unsigned long lastMillis = 0;
+short countFault = 0;
 
 void setup() {
   pinMode(LED_WARNING, OUTPUT);
@@ -47,16 +52,16 @@ void setup() {
       BLT_SERIAL.println(F("Não existe nenhum módulo configurado."));
       BLT_SERIAL.println(F("Pressione 'r' para fazer a varredura novamente."));
       while (true) {
-        if(BLT_SERIAL.available()){
+        if (BLT_SERIAL.available()) {
           if (((char)BLT_SERIAL.read()) == 'r') break;
-        }        
+        }
         digitalWrite(LED_WARNING, HIGH);
         delay(250);
         digitalWrite(LED_WARNING, LOW);
         delay(250);
       }
     }
-  } while(numberModules == 0);
+  } while (numberModules == 0);
 
   BLT_SERIAL.println(F("---------------------------------"));
   while (currentMod != NULL) {
@@ -64,8 +69,27 @@ void setup() {
     currentMod = currentMod->nextModule;
   }
 
+  BLT_SERIAL.println((String)F("Tamanho da memoria EEPROM: ") + EEPROM.length());
+  int timeDisplay = 0;
+  timeDisplay = EEPROM.get(EEPROM_ADDRESS_TIME_DISPLAY, timeDisplay);
+  BLT_SERIAL.println((String)F("Valor da memoria EEPROM: ") + timeDisplay);
+  if (timeDisplay == -1) {
+    timeDisplay = 300;
+    BLT_SERIAL.println((String)F("Valor inicial salvo na memoria EEPROM: ") + timeDisplay);
+    BLT_SERIAL.println((String)F("tamanho de bytes: ") + sizeof(timeDisplay));
+    EEPROM.put(EEPROM_ADDRESS_TIME_DISPLAY, timeDisplay);
+  }
+
+  if (timerModule != NULL) {
+    long timeDisplayTmp = (long)timeDisplay * 1000;
+    BLT_SERIAL.println(F("Tempo inicial definido no modulo display."));
+    writeConfigRegisterModule(timerModule->address, 'c', String(timeDisplayTmp));
+  }
+
+  sendResetGame();
+
   BLT_SERIAL.println();
-  BLT_SERIAL.println((String)F("Modulos configurados: ") + (String) numberModules);
+  BLT_SERIAL.println((String)F("Modulos configurados: ") + (String)numberModules);
   BLT_SERIAL.println((String)F("Fim do SETUP."));
 }
 
@@ -85,29 +109,37 @@ void loop() {
 }
 
 void executeInGame() {
-  if(BLT_SERIAL.available()) {
-    if(BLT_SERIAL.read() == 'r') {
+  if (BLT_SERIAL.available()) {
+    if (BLT_SERIAL.read() == 'r') {
       BLT_SERIAL.println(F("Resetando modulos."));
       writeAllRegisterModules_byte(STATUS, RESETING);
       currentStatusBomb = RESETING;
     }
   }
-  
+
   unsigned long currentMillis = millis();
-  if (currentMillis - lastMillis > 500) {
+  if (currentMillis - lastMillis > 1000) {
     if (validaTimer() == STOP_GAME) {
       BLT_SERIAL.println(F("GAME OVER!"));
       currentStatusBomb = STOP_GAME;
+      sendEndGame();
     }
+    validaPenalidadeModulos();
     lastMillis = currentMillis;
+  }
+
+  if (countFault >= MAX_FAULT_DEFUSE) {
+    BLT_SERIAL.println(F("GAME OVER!"));
+    currentStatusBomb = STOP_GAME;
+    sendEndGame();
   }
 }
 
 void executeStopGame() {
   BLT_SERIAL.println(F("Fim de jogo reinicie para jogar novamente."));
-  while(true) {
-    if(BLT_SERIAL.available()) {
-      if(BLT_SERIAL.read() == 'r') {
+  while (true) {
+    if (BLT_SERIAL.available()) {
+      if (BLT_SERIAL.read() == 'r') {
         BLT_SERIAL.println(F("Resetando modulos."));
         writeAllRegisterModules_byte(STATUS, RESETING);
         currentStatusBomb = RESETING;
@@ -117,11 +149,45 @@ void executeStopGame() {
   }
 }
 
+void validaPenalidadeModulos() {
+  currentMod = modules;
+  while (currentMod != NULL) {
+    if (!((String)currentMod->codeName).equalsIgnoreCase(ID_DISPLAY_TIMER)) {
+      String message = requestRegisterModule_String(currentMod->address, FAULT);
+      if (!message.equals("") && message.toInt() == 1) {
+        BLT_SERIAL.println((String)F("address...: 0x0") + currentMod->address);
+        BLT_SERIAL.println((String)F("codeName..: ") + currentMod->codeName);
+        BLT_SERIAL.println((String)F("Fault desc: ") + message);
+        countFault++;
+      }
+    }
+    currentMod = currentMod->nextModule;
+  }
+}
+
 Status validaTimer() {
   byte *response;
   requestRegisterModule_byte(timerModule->address, STATUS, &response);
-  BLT_SERIAL.println((String)F("status modulo: ") + Status_name[*response]);
+  // BLT_SERIAL.println((String)F("status modulo: ") + Status_name[*response]);
   return (Status)*response;
+}
+
+bool validaModulosReady() {
+  bool modulesReady = true;
+  currentMod = modules;
+
+  while (currentMod != NULL) {
+    byte *response;
+
+    requestRegisterModule_byte(currentMod->address, STATUS, &response);
+    currentMod->status = (Status)*response;
+    printInfoModule(currentMod);
+    if (currentMod->status != READY) modulesReady = false;
+
+    currentMod = currentMod->nextModule;
+  }
+
+  return modulesReady;
 }
 
 void waitBeginGame() {
@@ -134,33 +200,39 @@ void waitBeginGame() {
   BLT_SERIAL.println(F(" m;X;c;DATA; - Configurar modulo."));
 
   String command;
-  while(true) {
+  while (true) {
     command = BLT_SERIAL.readStringUntil(';');
 
     if (command.equalsIgnoreCase("m")) {
       String addressMod = BLT_SERIAL.readStringUntil(';');
       if (addressMod.equals("")) addressMod = "-1";
-      
-      Module* mod = getModuleByAddress(addressMod.toInt());
+
+      Module *mod = getModuleByAddress(addressMod.toInt());
       if (mod != NULL) {
         BLT_SERIAL.println(F("Modulo encontrado para configurar: "));
         printInfoModule(mod);
-        
+
         String action = BLT_SERIAL.readStringUntil(';');
-        
-        if(action.equalsIgnoreCase("e")) {
+
+        if (action.equalsIgnoreCase("e")) {
           String mensagem = BLT_SERIAL.readStringUntil(';');
           if (mensagem.equals("0") || mensagem.equals("1")) {
             writeRegisterModule_byte(mod->address, ENABLED, mensagem.equals("1"));
           } else {
-            BLT_SERIAL.println((String)F("opcao invalida: ") + mensagem);   
+            BLT_SERIAL.println((String)F("opcao invalida: ") + mensagem);
           }
-        } else if(action.equalsIgnoreCase("c")) {
+        } else if (action.equalsIgnoreCase("c")) {
           String mensagem = BLT_SERIAL.readStringUntil(';');
           BLT_SERIAL.println((String)F("data enviado: ") + mensagem);
+          if (mod == timerModule) {
+            int valor = ((int)(mensagem.toInt() / (long)1000));
+            BLT_SERIAL.println(F("Salvando na EEPROM o valor do timer em segundos."));
+            BLT_SERIAL.println((String)F("Valor salvo: ") + valor);
+            EEPROM.put(EEPROM_ADDRESS_TIME_DISPLAY, valor);
+          }
           writeConfigRegisterModule(mod->address, action.c_str()[0], mensagem);
         } else {
-          BLT_SERIAL.println((String)F("opcao invalida: ") + action);          
+          BLT_SERIAL.println((String)F("opcao invalida: ") + action);
         }
       } else {
         BLT_SERIAL.println((String)F("Nao existe modulo com o address: ") + addressMod);
@@ -168,13 +240,19 @@ void waitBeginGame() {
     } else if (command.equalsIgnoreCase("c")) {
       String action = BLT_SERIAL.readStringUntil(';');
       if (action.equalsIgnoreCase("1")) {
-        break;
+        if (validaModulosReady()) {
+          break;
+        } else {
+          BLT_SERIAL.println(F("Existem modulos que nao estao prontos"));
+        }
       } else if (action.equalsIgnoreCase("r")) {
-        BLT_SERIAL.println(F("Not implemented"));
+        sendResetGame();
+        delay(500);
+        validaModulosReady();
       }
     }
   }
-  
+
   BLT_SERIAL.println((String)F("Começando jogo em..."));
   for (int i = 3; i > 0; i--) {
     BLT_SERIAL.println(i);
@@ -186,7 +264,7 @@ void waitBeginGame() {
   sendBeginGame();
 }
 
-void printInfoModule(Module* mod) {
+void printInfoModule(Module *mod) {
   if (mod != NULL) {
     BLT_SERIAL.println((String)F("address.: ") + (String)mod->address);
     BLT_SERIAL.println((String)F("codeName: ") + (String)mod->codeName);
@@ -196,7 +274,7 @@ void printInfoModule(Module* mod) {
   }
 }
 
-Module* getModuleByAddress(int address) {
+Module *getModuleByAddress(int address) {
   currentMod = modules;
   while (currentMod != NULL) {
     if (currentMod->address == address) {
@@ -210,12 +288,36 @@ Module* getModuleByAddress(int address) {
 void sendBeginGame() {
   currentMod = modules;
 
-  while(currentMod != NULL) {
+  while (currentMod != NULL) {
     writeRegisterModule_byte(currentMod->address, STATUS, IN_GAME);
     currentMod = currentMod->nextModule;
   }
 
   BLT_SERIAL.println(F("Modulos avisados do inicio do game."));
+}
+
+void sendResetGame() {
+  currentMod = modules;
+
+  while (currentMod != NULL) {
+    writeRegisterModule_byte(currentMod->address, STATUS, RESETING);
+    currentMod = currentMod->nextModule;
+  }
+
+  countFault = 0;
+
+  BLT_SERIAL.println(F("Modulos avisados do reset do game."));
+}
+
+void sendEndGame() {
+  currentMod = modules;
+
+  while (currentMod != NULL) {
+    writeRegisterModule_byte(currentMod->address, STATUS, STOP_GAME);
+    currentMod = currentMod->nextModule;
+  }
+
+  BLT_SERIAL.println(F("Modulos avisados do FIM do game."));
 }
 
 int readModules() {
@@ -227,9 +329,9 @@ int readModules() {
 
   BLT_SERIAL.println(F("Iniciando a varredura de modulos."));
   for (int x = 0; x < MAX_ADDRESS; x++) {
-    BLT_SERIAL.println((String)F("------------- address 0x0") + (String) x + (String)F(" -------------"));
+    BLT_SERIAL.println((String)F("------------- address 0x0") + (String)x + (String)F(" -------------"));
     //inicia a transmição com um endereço e finaliza para verificar se houve resposta(se existe)
-    BLT_SERIAL.println((String)F("Iniciando leitura do endereco: ") + (String) x);
+    BLT_SERIAL.println((String)F("Iniciando leitura do endereco: ") + (String)x);
     Wire.beginTransmission(x);
     int error = Wire.endTransmission();
 
@@ -237,9 +339,9 @@ int readModules() {
     if (error == 0) {
       BLT_SERIAL.println(F("Modulo encontrado."));
       if (modules == NULL) {
-        modules = currentMod = (Module*) malloc(sizeof(Module));
+        modules = currentMod = (Module *)malloc(sizeof(Module));
       } else {
-        currentMod->nextModule = (Module*) malloc(sizeof(Module));
+        currentMod->nextModule = (Module *)malloc(sizeof(Module));
         currentMod = currentMod->nextModule;
       }
 
@@ -250,7 +352,7 @@ int readModules() {
 
       requestRegisterModule(x, CODE_NAME, &slaveCodeName);
       BLT_SERIAL.println((String)F("slaveCodeName: ") + (String)slaveCodeName);
-      
+
       requestRegisterModule(x, VERSION, &slaveVersion);
       BLT_SERIAL.println((String)F("slaveVersion.: ") + (String)slaveVersion);
 
@@ -260,11 +362,11 @@ int readModules() {
 
       currentMod->address = x;
       currentMod->codeName = slaveCodeName;
-      currentMod->version  = slaveVersion;
-      currentMod->status   = (Status) *slaveStatus;
+      currentMod->version = slaveVersion;
+      currentMod->status = (Status)*slaveStatus;
       currentMod->nextModule = NULL;
 
-      if(((String)slaveCodeName).equalsIgnoreCase("module-display")) {
+      if (((String)slaveCodeName).equalsIgnoreCase(ID_DISPLAY_TIMER)) {
         BLT_SERIAL.println("Encontrado modulo timer.");
         timerModule = currentMod;
       }
@@ -272,7 +374,7 @@ int readModules() {
       numbersModules++;
       BLT_SERIAL.println((String)F("reqSlave_address: ") + (String)currentMod->address);
     } else {
-      BLT_SERIAL.println((String)F("Sem Resposta, retorno: ") + (String) error);
+      BLT_SERIAL.println((String)F("Sem Resposta, retorno: ") + (String)error);
     }
     BLT_SERIAL.println(F("------------------------------------------------"));
   }
@@ -280,14 +382,14 @@ int readModules() {
 
   currentMod = modules;
 
-  BLT_SERIAL.println((String)F("Numero de modulos encontrados: ") + (String) numbersModules);
+  BLT_SERIAL.println((String)F("Numero de modulos encontrados: ") + (String)numbersModules);
   return numbersModules;
 }
 
 boolean writeAllRegisterModules_byte(EnumRegModule moduleRegister, byte value) {
   currentMod = modules;
 
-  while(currentMod != NULL) {
+  while (currentMod != NULL) {
     writeRegisterModule_byte(currentMod->address, moduleRegister, value);
     currentMod = currentMod->nextModule;
   }
@@ -296,71 +398,71 @@ boolean writeAllRegisterModules_byte(EnumRegModule moduleRegister, byte value) {
 boolean writeRegisterModule_byte(int i2c_addr, EnumRegModule moduleRegister, byte value) {
   byte error_code;
   boolean data_valid = false;
-  RegRequest regReq = {WRITE, MESSAGE, moduleRegister};
+  RegRequest regReq = { WRITE, MESSAGE, moduleRegister };
 
   Wire.beginTransmission(i2c_addr);
   Wire.write(regReq);
   Wire.write(value);
-  error_code  = Wire.endTransmission();    
+  error_code = Wire.endTransmission();
 
   if (error_code) {
     BLT_SERIAL.println("Fim da transmissao com erro: " + error_code);
     return false;
   }
-  
+
   return true;
 }
 
 boolean writeConfigRegisterModule(int i2c_addr, char command, String message) {
   byte error_code;
-  RegRequest regReq = {WRITE, MESSAGE, DATA};
+  RegRequest regReq = { WRITE, MESSAGE, DATA };
 
   Wire.beginTransmission(i2c_addr);
   Wire.write(regReq);
   Wire.write(command);
   Wire.write(message.c_str());
-  error_code  = Wire.endTransmission();    
+  error_code = Wire.endTransmission();
 
   if (error_code) {
     BLT_SERIAL.println((String)F("Fim da transmissao com erro: ") + error_code);
     return false;
   }
-  
+
   return true;
 }
 
 boolean requestRegisterModule(int i2c_addr, EnumRegModule moduleRegister, char **buffer) {
   byte error_code;
   boolean data_valid = false;
-  RegRequest regReq = {READ, LENGHT, moduleRegister};
+  RegRequest regReq = { READ, LENGHT, moduleRegister };
 
   Wire.beginTransmission(i2c_addr);
   Wire.write(regReq);
-  error_code  = Wire.endTransmission();    
+  error_code = Wire.endTransmission();
 
   if (error_code) {
     BLT_SERIAL.println("Fim da transmissao com erro: " + error_code);
     return false;
   }
-  
+
   Wire.requestFrom(i2c_addr, 1);
-  if(Wire.available()) {
+  if (Wire.available()) {
     int numResponse = Wire.read();
     regReq.lorm = MESSAGE;
 
-    Wire.beginTransmission(i2c_addr);                              
+    Wire.beginTransmission(i2c_addr);
     Wire.write(regReq);
-    error_code  = Wire.endTransmission();
+    error_code = Wire.endTransmission();
 
     if (error_code) {
       BLT_SERIAL.println("Fim da transmissao com erro: " + error_code);
       return false;
     }
 
-    Wire.requestFrom(i2c_addr, numResponse);    
+    Wire.requestFrom(i2c_addr, numResponse);
 
     if (Wire.available()) {
-      (*buffer) = (char*) malloc(sizeof(char) * numResponse + 1);
+      (*buffer) = (char *)malloc(sizeof(char) * numResponse + 1);
       int i = 0;
       while (Wire.available()) {
         (*buffer)[i++] = (char)Wire.read();
@@ -369,32 +471,57 @@ boolean requestRegisterModule(int i2c_addr, EnumRegModule moduleRegister, char *
       return true;
     }
   }
-  
+
   return false;
+}
+
+String requestRegisterModule_String(int i2c_addr, EnumRegModule moduleRegister) {
+  byte error_code;
+  RegRequest regReq = { READ, MESSAGE, moduleRegister };
+
+  Wire.beginTransmission(i2c_addr);
+  Wire.write(regReq);
+  error_code = Wire.endTransmission();
+
+  if (error_code) {
+    BLT_SERIAL.println((String)F("Fim da transmissao com erro: ") + (String)error_code);
+    return "";
+  }
+
+  Wire.requestFrom(i2c_addr, 32);
+  delay(50);
+
+  if (Wire.available()) {
+    String message = Wire.readStringUntil(';');
+    Serial.println((String)F("Mensagem string recebida: ") + message);
+    return message;
+  }
+
+  return "";
 }
 
 boolean requestRegisterModule_byte(int i2c_addr, EnumRegModule moduleRegister, byte **buffer) {
   byte error_code;
   boolean data_valid = false;
-  RegRequest regReq = {READ, MESSAGE, moduleRegister};
+  RegRequest regReq = { READ, MESSAGE, moduleRegister };
 
-  Wire.beginTransmission(i2c_addr);                              
+  Wire.beginTransmission(i2c_addr);
   Wire.write(regReq);
-  error_code  = Wire.endTransmission();
+  error_code = Wire.endTransmission();
 
   if (error_code) {
     BLT_SERIAL.println("Fim da transmissao com erro: " + error_code);
     return false;
   }
 
-  Wire.requestFrom(i2c_addr, 1);    
+  Wire.requestFrom(i2c_addr, 1);
 
-  (*buffer) = (byte*) malloc(sizeof(byte));
+  (*buffer) = (byte *)malloc(sizeof(byte));
   if (Wire.available()) {
     byte resp = Wire.read();
     (**buffer) = resp;
     return true;
   }
-  
+
   return false;
 }
