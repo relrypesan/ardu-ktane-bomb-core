@@ -6,8 +6,9 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <KtaneCore.h>
+#include <ArduUtil.h>
 
-#define BLT_SERIAL Serial1
+#define BLT_SERIAL Serial
 
 #define PIN_SDA 20
 #define PIN_SCL 21
@@ -17,11 +18,11 @@
 
 #define EEPROM_ADDRESS_TIME_DISPLAY 1023
 
-#define ID_DISPLAY_TIMER "module-display"
+#define ID_DISPLAY_TIMER F("module-display")
 #define MAX_FAULT_DEFUSE 3
 
 typedef struct MODULE {
-  int address;
+  short address;
   char *codeName;
   char *version;
   Status status;
@@ -29,11 +30,14 @@ typedef struct MODULE {
 } Module;
 
 Module *modules, *currentMod, *timerModule;
+short numberModules = 0;
 
 Status currentStatusBomb = RESETING;
 
 volatile unsigned long lastMillis = 0;
 short countFault = 0;
+short countModulesToDefuse = 0;
+short countModulesDefused = 0;
 
 void setup() {
   pinMode(LED_WARNING, OUTPUT);
@@ -42,50 +46,13 @@ void setup() {
   BLT_SERIAL.begin(38400);
   BLT_SERIAL.println(F("Iniciando programa..."));
 
-  int numberModules = 0;
-  do {
-    numberModules = readModules();
+  // delay para garantir que os modulos já estarão iniciados e endereçados
+  delay(1000);
 
-    // Caso não exista nenhum modulo, fica no loop de alerta
-    if (numberModules == 0) {
-      BLT_SERIAL.println(F("ALERTA!!!"));
-      BLT_SERIAL.println(F("Não existe nenhum módulo configurado."));
-      BLT_SERIAL.println(F("Pressione 'r' para fazer a varredura novamente."));
-      while (true) {
-        if (BLT_SERIAL.available()) {
-          if (((char)BLT_SERIAL.read()) == 'r') break;
-        }
-        digitalWrite(LED_WARNING, HIGH);
-        delay(250);
-        digitalWrite(LED_WARNING, LOW);
-        delay(250);
-      }
-    }
-  } while (numberModules == 0);
+  numberModules = waitBuscaDispositivosConectados();
+  printAllModules();
 
-  BLT_SERIAL.println(F("---------------------------------"));
-  while (currentMod != NULL) {
-    printInfoModule(currentMod);
-    currentMod = currentMod->nextModule;
-  }
-
-  BLT_SERIAL.println((String)F("Tamanho da memoria EEPROM: ") + EEPROM.length());
-  int timeDisplay = 0;
-  timeDisplay = EEPROM.get(EEPROM_ADDRESS_TIME_DISPLAY, timeDisplay);
-  BLT_SERIAL.println((String)F("Valor da memoria EEPROM: ") + timeDisplay);
-  if (timeDisplay == -1) {
-    timeDisplay = 300;
-    BLT_SERIAL.println((String)F("Valor inicial salvo na memoria EEPROM: ") + timeDisplay);
-    BLT_SERIAL.println((String)F("tamanho de bytes: ") + sizeof(timeDisplay));
-    EEPROM.put(EEPROM_ADDRESS_TIME_DISPLAY, timeDisplay);
-  }
-
-  if (timerModule != NULL) {
-    long timeDisplayTmp = (long)timeDisplay * 1000;
-    BLT_SERIAL.println(F("Tempo inicial definido no modulo display."));
-    writeConfigRegisterModule(timerModule->address, 'c', String(timeDisplayTmp));
-  }
-
+  initConfigModules();
   sendResetGame();
 
   BLT_SERIAL.println();
@@ -102,10 +69,74 @@ void loop() {
     case IN_GAME:
       executeInGame();
       break;
+    case DEFUSED:
     case STOP_GAME:
       executeStopGame();
       break;
   }
+}
+
+int waitBuscaDispositivosConectados() {
+  int countModules = 0;
+  bool ready = false;
+  do {
+    countModules = readModules();
+    bool allRequiredModulesOk = validRequiredModules();
+    ready = true;
+
+    // Caso não exista nenhum modulo, fica no loop de alerta
+    if (countModules == 0) {
+      BLT_SERIAL.println(F("ALERTA!!!\nNao existe nenhum modulo configurado."));
+      ready = false;
+    } else if (allRequiredModulesOk == false) {
+      BLT_SERIAL.println(F("ALERTA!!!\nModulos necessarios para o jogo."));
+      ready = false;
+    }
+
+    if(ready == false) {
+      BLT_SERIAL.println(F("Pressione 'r' para fazer a varredura novamente."));
+      while (true) {
+        if (BLT_SERIAL.available()) {
+          if (((char)BLT_SERIAL.read()) == 'r') break;
+        }
+        digitalWrite(LED_WARNING, HIGH);
+        delay(250);
+        digitalWrite(LED_WARNING, LOW);
+        delay(250);
+      }      
+    }
+  } while (ready == false);
+
+  BLT_SERIAL.println(F("Busca de modulos finalizada."));
+
+  return countModules;
+}
+
+void initConfigModules() {
+  BLT_SERIAL.println((String)F("Tamanho da memoria EEPROM: ") + EEPROM.length());
+  int timeDisplay = 0;
+  timeDisplay = EEPROM.get(EEPROM_ADDRESS_TIME_DISPLAY, timeDisplay);
+  BLT_SERIAL.println((String)F("Valor da memoria EEPROM: ") + timeDisplay);
+  if (timeDisplay == -1) {
+    timeDisplay = 300;
+    BLT_SERIAL.println((String)F("Valor inicial salvo na memoria EEPROM: ") + timeDisplay);
+    BLT_SERIAL.println((String)F("tamanho de bytes: ") + sizeof(timeDisplay));
+    EEPROM.put(EEPROM_ADDRESS_TIME_DISPLAY, timeDisplay);
+  }
+
+  if (timerModule != NULL) {
+    long timeDisplayTmp = (long)timeDisplay * 1000;
+    BLT_SERIAL.println(F("Tempo inicial definido no modulo display."));
+    writeConfigRegisterModule(timerModule->address, 'c', String(timeDisplayTmp));
+  }
+}
+
+bool validRequiredModules() {
+  if (timerModule == NULL) {
+    BLT_SERIAL.println((String)F("Modulo requirido não encontrado: ") + (String)ID_DISPLAY_TIMER);
+    return false;
+  }
+  return true;
 }
 
 void executeInGame() {
@@ -125,12 +156,18 @@ void executeInGame() {
       sendEndGame();
     }
     validaPenalidadeModulos();
+    validaModulosDefusados();
+    Serial.println((String)F("Memory free: ") + freeMemory());
     lastMillis = currentMillis;
   }
 
   if (countFault >= MAX_FAULT_DEFUSE) {
     BLT_SERIAL.println(F("GAME OVER!"));
     currentStatusBomb = STOP_GAME;
+    sendEndGame();
+  } else if (countModulesToDefuse == countModulesDefused) {
+    BLT_SERIAL.println(F("PARABENS! Bomba defusada a tempo!"));
+    currentStatusBomb = DEFUSED;
     sendEndGame();
   }
 }
@@ -165,24 +202,50 @@ void validaPenalidadeModulos() {
   }
 }
 
+void validaModulosDefusados() {
+  currentMod = modules;
+  while (currentMod != NULL) {
+    if (!((String)currentMod->codeName).equalsIgnoreCase(ID_DISPLAY_TIMER)) {
+      // String message = requestRegisterModule_String(currentMod->address, STATUS);
+      byte *response;
+      requestRegisterModule_byte(currentMod->address, STATUS, &response);
+      if (currentMod->status != DEFUSED && (Status)*response == DEFUSED) {
+        currentMod->status = DEFUSED;
+        BLT_SERIAL.println((String)F("address...: 0x0") + currentMod->address);
+        BLT_SERIAL.println((String)F("codeName..: ") + currentMod->codeName);
+        BLT_SERIAL.println((String)F("MODULO DEFUSADO!"));
+        countModulesDefused++;
+      }
+      free(response);
+    }
+    currentMod = currentMod->nextModule;
+  }
+}
+
 Status validaTimer() {
   byte *response;
   requestRegisterModule_byte(timerModule->address, STATUS, &response);
+  Status status = (Status)*response;
+  free(response);
   // BLT_SERIAL.println((String)F("status modulo: ") + Status_name[*response]);
-  return (Status)*response;
+  return status;
 }
 
 bool validaModulosReady() {
   bool modulesReady = true;
   currentMod = modules;
+  countModulesToDefuse = countModulesDefused = 0;
 
   while (currentMod != NULL) {
     byte *response;
 
     requestRegisterModule_byte(currentMod->address, STATUS, &response);
+    // free(&(currentMod->status));
     currentMod->status = (Status)*response;
+    free(response);
     printInfoModule(currentMod);
     if (currentMod->status != READY) modulesReady = false;
+    if (currentMod != timerModule) countModulesToDefuse++;
 
     currentMod = currentMod->nextModule;
   }
@@ -245,14 +308,21 @@ void waitBeginGame() {
         } else {
           BLT_SERIAL.println(F("Existem modulos que nao estao prontos"));
         }
-      } else if (action.equalsIgnoreCase("r")) {
+      } else if (action.equalsIgnoreCase("r")) { // reset modules
         sendResetGame();
         delay(500);
         validaModulosReady();
+      } else if (action.equalsIgnoreCase("s")) { // search modules
+        waitBuscaDispositivosConectados();
+      } else if (action.equalsIgnoreCase("l")) { // list modules
+        printAllModules();
       }
     }
+
+    BLT_SERIAL.println((String)F("Memory free: ") + freeMemory());
   }
 
+  BLT_SERIAL.println((String)F("Modulos a serem defusados: ") + countModulesToDefuse);
   BLT_SERIAL.println((String)F("Começando jogo em..."));
   for (int i = 3; i > 0; i--) {
     BLT_SERIAL.println(i);
@@ -262,6 +332,18 @@ void waitBeginGame() {
 
   currentStatusBomb = IN_GAME;
   sendBeginGame();
+}
+
+void printAllModules() {
+  Module *tmpModule = modules;
+  unsigned short countModules = 0;
+  BLT_SERIAL.println(F("---------------------------------"));
+  while (tmpModule != NULL) {
+    printInfoModule(tmpModule);
+    countModules++;
+    tmpModule = tmpModule->nextModule;
+  }
+  BLT_SERIAL.println((String)F("Modules count: ") + countModules);
 }
 
 void printInfoModule(Module *mod) {
@@ -322,10 +404,17 @@ void sendEndGame() {
 
 int readModules() {
   int numbersModules = 0;
-  modules = currentMod = NULL;
+  currentMod = modules;
 
-  // delay para garantir que os modulos já estarão iniciados e endereçados
-  delay(1000);
+  while (currentMod != NULL) {
+    modules = modules->nextModule;
+    free(currentMod->codeName);
+    free(currentMod->version);
+    free(currentMod);
+    currentMod = modules;
+  }
+
+  modules = currentMod = timerModule = NULL;
 
   BLT_SERIAL.println(F("Iniciando a varredura de modulos."));
   for (int x = 0; x < MAX_ADDRESS; x++) {
@@ -365,6 +454,8 @@ int readModules() {
       currentMod->version = slaveVersion;
       currentMod->status = (Status)*slaveStatus;
       currentMod->nextModule = NULL;
+
+      free(slaveStatus);
 
       if (((String)slaveCodeName).equalsIgnoreCase(ID_DISPLAY_TIMER)) {
         BLT_SERIAL.println("Encontrado modulo timer.");
